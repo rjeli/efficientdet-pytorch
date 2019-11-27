@@ -12,6 +12,7 @@ Options:
     --resume=<path> Resume from checkpoint
     --profile       Use torch.autograd.profiler
     --lr=<lr>       Learning rate [default: 1e-3]
+    --save=<n>      Save every n epochs
 """
 
 from tqdm import tqdm
@@ -81,7 +82,7 @@ def main(args):
         ds_idxs = range(int(pct * len(ds)))
         ds = torch.utils.data.Subset(ds, ds_idxs)
         vds_idxs = range(max(1024, int(pct * len(vds))))
-        # vds = torch.utils.data.Subset(vds, vds_idxs)
+        vds = torch.utils.data.Subset(vds, ds_idxs)
     if args['--n']:
         n_samples = int(args['--n'])
         ds = torch.utils.data.Subset(ds, range(n_samples))
@@ -99,6 +100,10 @@ def main(args):
     epochs = 100
     if args['--epochs']:
         epochs = int(args['--epochs'])
+
+    save = 10
+    if args['--save']:
+        save = int(args['--save'])
 
     lr = float(args['--lr'])
 
@@ -197,13 +202,26 @@ def main(args):
             pbar = tqdm(vdl)
             for imgs, boxes, classes, score_masks in pbar:
                 imgs = imgs.cuda()
+                if any([torch.isnan(x).any() for x in boxes]):
+                    print('boxes nan')
+                if any([torch.isnan(x).any() for x in classes]):
+                    print('classes nan')
+                if any([torch.isnan(x).any() for x in score_masks]):
+                    print('sm nan')
                 preds = model(imgs)
+                if any([torch.isnan(x[0]).any() for x in preds]):
+                    print('pred0 nan')
+                if any([torch.isnan(x[1]).any() for x in preds]):
+                    print('pred1 nan')
 
                 total_coord_loss = 0.
                 total_obj_loss = 0.
                 total_cls_loss = 0.
 
                 for i, cell_sz in enumerate(CELL_SZS):
+                    pboxes = preds[i][0]
+                    # clip w, h to prevent instability
+                    pboxes[:,3:5] = torch.clamp(pboxes[:,3:5], max=3)
                     coord_loss, obj_loss, cls_loss = calc_loss(cell_sz, preds[i], 
                         boxes[i].cuda(), classes[i].cuda(), score_masks[i])
                     total_coord_loss += coord_loss
@@ -225,7 +243,7 @@ def main(args):
         writer.add_scalar('val_cls_loss', epoch_cls_loss_v, epoch)
         writer.flush()
 
-        if epoch % 10 == 0:
+        if epoch % save == 0:
             torch.save({
                 'epoch': epoch,
                 'model': model.state_dict(), 
