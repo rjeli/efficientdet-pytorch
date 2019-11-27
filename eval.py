@@ -26,7 +26,7 @@ from pycocotools.cocoeval import COCOeval
 # @profile
 def main(args):
     model = EfficientDet().cuda()
-    model.load_state_dict(torch.load(args['<model>']))
+    model.load_state_dict(torch.load(args['<model>'])['model'])
     model.eval()
 
     batch_sz = 16
@@ -98,49 +98,62 @@ def main(args):
             sbox = boxes[scale_i]
             scls = classes[scale_i]
 
-            cell_y_centers, cell_x_centers = CELL_CENTERS[scale_i]
-
             pbox, pcls = preds[scale_i]
-            pred_xs = sigmoid(pbox[1]) * cell_sz + cell_x_centers
-            pred_ys = sigmoid(pbox[2]) * cell_sz + cell_y_centers
-            pred_ws = cell_sz * np.exp(pbox[3])
-            pred_hs = cell_sz * np.exp(pbox[4])
-            pred_objs = sigmoid(pbox[0])
-            pred_cls = np.argmax(pcls, axis=1)
 
             for row in range(INPUT_SZ//cell_sz):
                 for col in range(INPUT_SZ//cell_sz):
 
                     # draw gt
                     if sbox[0,row,col] == 1.0:
+                        cls_id = int(scls[row,col])
+                        cls_name = CAT_IDX_TO_NAME[cls_id]
+                        print('== GT ==')
+                        print(f'{cls_name} @ scale:{scale_i} row:{row} col:{col}')
+                        print('  sbox:', sbox[:,row,col])
                         cx, cy, w, h = sbox[1:,row,col]
-                        cx *= w_ratio
-                        cy *= h_ratio
-                        w *= w_ratio
-                        h *= h_ratio
+                        cx = (col*cell_sz + cx*cell_sz) * w_ratio
+                        cy = (row*cell_sz + cy*cell_sz) * h_ratio
+                        w = w * cell_sz * w_ratio
+                        h = h * cell_sz * h_ratio
                         x0 = int(cx-w/2)
                         y0 = int(cy-h/2) 
                         x1 = int(cx+w/2)
                         y1 = int(cy+h/2)
                         draw.rectangle([x0,y0,x1,y1], fill=None, outline=(0,255,0))
-                        cls_id = int(scls[row,col])
-                        cls_name = CAT_IDX_TO_NAME[cls_id]
                         draw.text((x0,y0-12), cls_name, fill=(0,255,0), font=font)
 
                     # draw pred
-                    if pred_objs[row,col] > thres:
-                        cx = pred_xs[row,col] * w_ratio
-                        cy = pred_ys[row,col] * h_ratio
-                        w = pred_ws[row,col] * w_ratio
-                        h = pred_hs[row,col] * h_ratio
+                    score = sigmoid(pbox[0,row,col])
+                    if score > thres:
+                        print(f'== PRED ({score:.2f}) ==')
+                        cls_vec = pcls[:,row,col]
+                        cls_id = np.argmax(cls_vec)
+                        sm = np.exp(cls_vec) / np.sum(np.exp(cls_vec))
+                        cls_name = CAT_IDX_TO_NAME[cls_id]
+                        info = f'scale:{scale_i} row:{row} col:{col}'
+                        print(f'{cls_name} ({sm[cls_id]:.2f}) @ {info}')
+                        print('  pbox:', pbox[:,row,col])
+
+                        cx = sigmoid(pbox[1,row,col])
+                        cy = sigmoid(pbox[2,row,col])
+                        w = np.exp(pbox[3,row,col])
+                        h = np.exp(pbox[4,row,col])
+                        print(f'  0 cx:{cx:.2f} cy:{cy:.2f} w:{w:.2f} h:{h:.2f}')
+
+                        cx = (col*cell_sz + cx*cell_sz) * w_ratio
+                        cy = (row*cell_sz + cy*cell_sz) * h_ratio
+                        w = w * cell_sz * w_ratio
+                        h = h * cell_sz * h_ratio
+                        print(f'  1 cx:{cx:.2f} cy:{cy:.2f} w:{w:.2f} h:{h:.2f}')
+
                         x0 = int(cx-w/2)
                         y0 = int(cy-h/2) 
                         x1 = int(cx+w/2)
                         y1 = int(cy+h/2)
-                        draw.rectangle([x0,y0,x1,y1], fill=None, outline=(255,255,0))
-                        cls_id = pred_cls[row,col]
-                        cls_name = CAT_IDX_TO_NAME[cls_id]
-                        draw.text((x0,y0-12), cls_name, fill=(255,255,0), font=font)
+                        draw.rectangle([x0,y0,x1,y1], 
+                            fill=None, outline=(255,255,0))
+                        draw.text((min(orig_w,max(0,x0)),min(orig_h,max(0,y0-12))), 
+                            cls_name, fill=(255,255,0), font=font)
 
         orig_img.save('evalshow.png')
 

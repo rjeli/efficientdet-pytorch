@@ -16,34 +16,36 @@ from efficientnet_pytorch.model import EfficientNet, MBConvBlock
 from efficientnet_pytorch.utils import BlockArgs, BlockDecoder, \
     round_filters, round_repeats
 
+import geffnet
+from geffnet.efficientnet_builder import decode_arch_def, EfficientNetBuilder, \
+    InvertedResidual, DepthwiseSeparableConv
+from geffnet.activations import get_act_layer
+
 from config import N_CLASSES, INPUT_SZ, BOX_PRED_SZ, CLASS_PRED_SZ
 
 DEBUG_SIZES = os.environ.get('DBG_SZS') is not None
 def dbgsz(s, x):
     if DEBUG_SIZES:
         print(f'{s}: {x.shape}')
+    return x
 
 EXTRA_BLOCKS_ARGS = [
     'r4_k5_s22_e6_i192_o224_se0.25',
     'r4_k5_s22_e6_i224_o256_se0.25',
 ]
-BIFPN_INPUT_LAYER_IDXS = set([4, 10, 14, 18, 22])
+BIFPN_INPUT_LAYER_IDXS = [5, 7, 8, 9, 10]
 BIFPN_N_LAYERS = 2
 BIFPN_N_CHS = 64
 BOX_CLASS_N_LAYERS = 3
 
-def conv2d_relu_bn(in_ch, out_ch, k):
-    return nn.Sequential(
-        nn.Conv2d(in_ch, out_ch, k, padding=k//2),
-        nn.ReLU(),
-        nn.BatchNorm2d(out_ch),
-    )
-
-def conv2d_bn(in_ch, out_ch, k):
-    return nn.Sequential(
+def conv_block(in_ch, out_ch, k, act=True):
+    layers = [
         nn.Conv2d(in_ch, out_ch, k, padding=k//2),
         nn.BatchNorm2d(out_ch),
-    )
+    ]
+    if act:
+        layers.append(nn.ReLU())
+    return nn.Sequential(*layers)
 
 class BiFPN(nn.Module):
     def __init__(self, n_inputs):
@@ -57,11 +59,11 @@ class BiFPN(nn.Module):
 
         self.intermediate_convs = nn.ModuleList([])
         for _ in range(self.n_inputs-2):
-            self.intermediate_convs.append(conv2d_relu_bn(
+            self.intermediate_convs.append(conv_block(
                 in_ch=BIFPN_N_CHS, out_ch=BIFPN_N_CHS, k=3))
         self.output_convs = nn.ModuleList([])
         for _ in range(self.n_inputs):
-            self.output_convs.append(conv2d_relu_bn(
+            self.output_convs.append(conv_block(
                 in_ch=BIFPN_N_CHS, out_ch=BIFPN_N_CHS, k=3))
 
     @staticmethod
@@ -71,8 +73,12 @@ class BiFPN(nn.Module):
         output = torch.zeros_like(xs[0])
         for i, x in enumerate(xs):
             if x.shape[-1] != target_sz:
-                assert x.shape[-1] in [target_sz//2, target_sz*2]
-                x = F.interpolate(x, size=target_sz, mode='nearest')
+                if x.shape[-1] == target_sz//2:
+                    x = F.interpolate(x, scale_factor=2, mode='nearest')
+                elif x.shape[-1] == target_sz*2:
+                    x = F.avg_pool2d(x, 2)
+                else:
+                    assert False
             output += ws[i] * x
         output /= ws.sum() + 1e-4
         return output
@@ -100,63 +106,60 @@ class BiFPN(nn.Module):
         return outputs
 
 class EfficientDet(nn.Module):
-    def __init__(self):
+    def __init__(self, drop_rate=.25, drop_connect_rate=.2):
         super().__init__()
-        en = EfficientNet.from_pretrained('efficientnet-b0')
-        self.dcr = en._global_params.drop_connect_rate
-        self.stem = nn.Sequential(en._conv_stem, en._bn0, en._swish)
-        self.en_blocks = nn.ModuleList(en._blocks[:-1])
-        for bs in EXTRA_BLOCKS_ARGS:
-            b_args = BlockDecoder._decode_block_string(bs)
-            b_args = b_args._replace(
-                input_filters=round_filters(b_args.input_filters, 
-                    en._global_params),
-                output_filters=round_filters(b_args.output_filters,
-                    en._global_params),
-                num_repeat=round_repeats(b_args.num_repeat,
-                    en._global_params),
-            )
-            self.en_blocks.append(
-                MBConvBlock(b_args, en._global_params))
-            if b_args.num_repeat > 1:
-                b_args = b_args._replace(
-                    input_filters=b_args.output_filters, stride=1)
-            for _ in range(b_args.num_repeat-1):
-                self.en_blocks.append(
-                    MBConvBlock(b_args, en._global_params))
+
+        en = geffnet.efficientnet_b0(pretrained=True, as_sequential=True,
+            drop_rate=drop_rate, drop_connect_rate=drop_connect_rate)
+        self.en_blocks = nn.ModuleList(iter(en[:9]))
+
+        arch = [
+            ['ir_r4_k5_s2_e6_c224_se0.25'],
+            ['ir_r4_k5_s2_e6_c256_se0.25'],
+        ]
+        block_args = decode_arch_def(arch)
+
+        en_builder = EfficientNetBuilder(
+            act_layer=get_act_layer('swish'),
+            drop_connect_rate=drop_connect_rate)
+        en_builder.in_chs = 192
+        en_builder.block_count = sum(len(x) for x in block_args)
+        en_builder.block_idx = 9
+        for ba in block_args:
+            self.en_blocks.append(en_builder._make_stack(ba))
+
         self.bifpn_input_convs = nn.ModuleList([])
         for i in BIFPN_INPUT_LAYER_IDXS:
-            block = self.en_blocks[i]
-            self.bifpn_input_convs.append(conv2d_relu_bn(
-                in_ch=block._block_args.output_filters, out_ch=BIFPN_N_CHS, k=3))
+            in_ch = self.en_blocks[i][-1].bn3.num_features
+            self.bifpn_input_convs.append(conv_block(
+                in_ch=in_ch, out_ch=BIFPN_N_CHS, k=3))
+
         self.bifpns = nn.ModuleList([])
         for _ in range(BIFPN_N_LAYERS):
             self.bifpns.append(BiFPN(n_inputs=len(BIFPN_INPUT_LAYER_IDXS)))
-        box_layers = nn.ModuleList([])
-        class_layers = nn.ModuleList([])
+
+        box_layers = []
+        class_layers = []
         for _ in range(BOX_CLASS_N_LAYERS):
             box_layers.append(
-                conv2d_relu_bn(in_ch=BIFPN_N_CHS, out_ch=BIFPN_N_CHS, k=3))
+                conv_block(in_ch=BIFPN_N_CHS, out_ch=BIFPN_N_CHS, k=3))
             class_layers.append(
-                conv2d_relu_bn(in_ch=BIFPN_N_CHS, out_ch=BIFPN_N_CHS, k=3))
+                conv_block(in_ch=BIFPN_N_CHS, out_ch=BIFPN_N_CHS, k=3))
         # output layers
-        box_layers.append(nn.Conv2d(BIFPN_N_CHS, BOX_PRED_SZ, 3, padding=1))
-        class_layers.append(nn.Conv2d(BIFPN_N_CHS, CLASS_PRED_SZ, 3, padding=1))
+        box_layers.append(conv_block(BIFPN_N_CHS, BOX_PRED_SZ, k=3, act=False))
+        class_layers.append(conv_block(BIFPN_N_CHS, CLASS_PRED_SZ, k=3, act=False))
         self.box_layers = nn.Sequential(*box_layers)
         self.class_layers = nn.Sequential(*class_layers)
 
     def forward(self, x):
-        x = self.stem(x)
-        dbgsz('stem', x)
+        dbgsz('input', x)
         bifpn_xs = []
         for i, b in enumerate(self.en_blocks):
-            dcr = self.dcr * float(i) / len(self.en_blocks)
-            x = b(x, drop_connect_rate=dcr)
+            x = b(x)
             dbgsz(f'block {i}', x)
             if i in BIFPN_INPUT_LAYER_IDXS:
                 bifpn_xs.append(x)
-        bifpn_xs = [self.bifpn_input_convs[i](inp) 
-                    for i, inp in enumerate(bifpn_xs)]
+        bifpn_xs = [bic(x) for bic, x in zip(self.bifpn_input_convs, bifpn_xs)]
         for i, bifpn_x in enumerate(bifpn_xs):
             dbgsz(f'bifpn_input {i}', bifpn_x)
         for i, bifpn in enumerate(self.bifpns):
@@ -177,6 +180,19 @@ if __name__ == '__main__':
 
     if args['--print']:
         print(model)
+        ps = list(model.parameters())
+        print('np:', sum(p.numel() for p in ps if p.requires_grad))
+        import thop
+        x = torch.randn(1, 3, INPUT_SZ, INPUT_SZ, device='cuda')
+        flops, params = thop.profile(model, inputs=(x,))
+        print(flops, params)
+
+        n = 0
+        for b in model.bifpns:
+            n += sum(p.numel() for p in b.parameters())
+        n += sum(p.numel() for p in model.box_layers.parameters())
+        n += sum(p.numel() for p in model.class_layers.parameters())
+        print('n:', n)
 
     if args['--print-sizes']:
         x = torch.randn(1, 3, INPUT_SZ, INPUT_SZ, device='cuda')
@@ -198,11 +214,14 @@ if __name__ == '__main__':
 
     if args['--make-dot']:
         x = torch.randn(1, 3, INPUT_SZ, INPUT_SZ, device='cuda')
-        y = model(x)
+        y = model(x)[0]
         from torchviz import make_dot
         G = make_dot(y[0].sum(), params=dict(model.named_parameters()))
         G.format = 'pdf'
-        G.render('model-graph.pdf')
+        G.render('objs_graph')
+        G = make_dot(y[1].sum(), params=dict(model.named_parameters()))
+        G.format = 'pdf'
+        G.render('cls_graph')
 
     if args['--time']:
         import time

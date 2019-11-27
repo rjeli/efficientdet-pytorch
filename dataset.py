@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 Usage:
-    ./dataset.py [--show] [--ipy]
+    ./dataset.py [--show=<which>] [--ipy]
 """
 
+import os
 import torch
 import numpy as np
 import json
@@ -74,7 +75,7 @@ class CocoDataset(torch.utils.data.Dataset):
         h_ratio = self.img_size / orig_h
         if self.return_extra:
             orig_img = img.copy()
-        img = img.resize((self.img_size, self.img_size), Image.BILINEAR)
+        img = img.resize((self.img_size, self.img_size), Image.BICUBIC)
         if self.img_transform is not None:
             img = self.img_transform(img)
         # score 0 = negative
@@ -110,14 +111,31 @@ class CocoDataset(torch.utils.data.Dataset):
                     scale_iou, score_mask)
             maxes = [scale_iou.max() for scale_iou in ious]
             best_scale = max(range(len(maxes)), key=lambda i: maxes[i])
-            best_row, best_col = argmax2d(ious[best_scale])
+            cell_sz = CELL_SZS[best_scale]
+            best_iou = maxes[best_scale]
+            # if multiple cells have best iou, assign to one closest to center
+            best_row, best_col = None, None
+            best_dist = np.inf
+            for row, col in zip(*np.where(ious[best_scale] == best_iou)):
+                cx = col*cell_sz + cell_sz/2
+                cy = row*cell_sz + cell_sz/2
+                dist = (cx-(x+w/2))**2 + (cy-(y+h/2))**2
+                if dist < best_dist:
+                    best_dist, best_row, best_col = dist, row, col
             def set_box(i, val):
                 boxes[best_scale][i, best_row, best_col] = val
             set_box(0, 1)
-            set_box(1, x+w/2)
-            set_box(2, y+h/2)
-            set_box(3, w)
-            set_box(4, h)
+            cx = x + w/2
+            cy = y + h/2
+            set_box(1, (cx - best_col*cell_sz) / cell_sz)
+            set_box(2, (cy - best_row*cell_sz) / cell_sz)
+            set_box(3, w / cell_sz)
+            set_box(4, h / cell_sz)
+            name = CAT_IDX_TO_NAME[cat_idx]
+            if 'DBGDATA' in os.environ:
+                print(f'{name} @ scale:{best_scale} row:{best_row} col:{best_col}')
+                print(f'  iou:{ious[best_scale][best_row,best_col]}')
+                print(' ', boxes[best_scale][:,best_row,best_col])
             classes[best_scale][best_row, best_col] = cat_idx
             score_masks[best_scale][best_row, best_col] = 2
         rets = [img, boxes, classes, score_masks]
@@ -134,10 +152,10 @@ if __name__ == '__main__':
 
 
     if args['--show']:
-        print('showing')
+        which = int(args['--show'])
+        print('showing', which)
 
-        idx = random.randint(0, len(ds)-1)
-        img, boxes, classes, score_masks = ds[idx]
+        img, boxes, classes, score_masks = ds[which]
 
         print('img:')
         print(img)
@@ -175,7 +193,12 @@ if __name__ == '__main__':
                     cls_idx = classes[i][row, col]
                     cls_name = CAT_IDX_TO_NAME[int(cls_idx)]
                     x, y, w, h = boxes[i][1:, row, col]
-                    draw.rectangle([int(x-w/2), int(y-h/2), int(x+w/2), int(y+h/2)],
+                    x = col*cell_sz + x*cell_sz
+                    y = row*cell_sz + y*cell_sz
+                    w = w * cell_sz
+                    h = h * cell_sz
+                    draw.rectangle(
+                        [int(x-w/2), int(y-h/2), int(x+w/2), int(y+h/2)],
                         fill=None, outline=(0,255,0))
                     draw.text((int(x-w/2), int(y-h/2)), cls_name, 
                         fill=(0,255,0), font=font)
@@ -187,19 +210,6 @@ if __name__ == '__main__':
         for i, scale_img in enumerate(scale_imgs):
             combined.paste(scale_img, (0, i*INPUT_SZ))
         combined.save('target-vis.png')
-
-        """
-        for cat_idx, (x, y, w, h) in targets:
-            x0 = int(x)
-            y0 = int(y)
-            x1 = int(x+w)
-            y1 = int(y+h)
-            draw.rectangle([x0, y0, x1, y1], fill=None, outline=(255,0,0))
-            cat_name = CAT_IDX_TO_NAME[cat_idx]
-            print(cat_name)
-            draw.text((x0, y0-12), cat_name, fill=(255,0,0), font=font)
-        img.save('dataset_example.png')
-        """
 
     if args['--ipy']:
         from IPython import embed; embed()
