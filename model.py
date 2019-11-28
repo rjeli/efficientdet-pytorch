@@ -170,6 +170,9 @@ class EfficientDet(nn.Module):
         for i, (box_pred, class_pred) in enumerate(outputs):
             dbgsz(f'box_pred {i}', box_pred)
             dbgsz(f'class_pred {i}', class_pred)
+            # clamp w, h to prevent exp overflow
+            if not self.train:
+                box_pred[:,3:5] = torch.clamp(box_pred[:,3:5], max=3)
         return outputs
 
 if __name__ == '__main__':

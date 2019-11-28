@@ -39,6 +39,11 @@ img_transform = transforms.Compose([
     transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
 ])
 
+aug_transform = transforms.Compose([
+    transforms.ColorJitter(brightness=.3, contrast=.3, saturation=.05, hue=.05),
+    img_transform,
+])
+
 def calc_loss(cell_sz, preds, gt_boxes, gt_classes, score_masks,
               apply_mean=True):
     # x, y, w, h
@@ -71,7 +76,7 @@ def main(args):
     assert torch.cuda.is_available()
 
     ds = CocoDataset(is_train=True, img_size=INPUT_SZ, 
-        img_transform=img_transform)
+        img_transform=aug_transform)
     vds = CocoDataset(is_train=False, img_size=INPUT_SZ, 
         img_transform=img_transform)
 
@@ -81,8 +86,8 @@ def main(args):
         pct = int(args['--pct']) / 100
         ds_idxs = range(int(pct * len(ds)))
         ds = torch.utils.data.Subset(ds, ds_idxs)
-        vds_idxs = range(max(1024, int(pct * len(vds))))
-        vds = torch.utils.data.Subset(vds, ds_idxs)
+        # ds = torch.utils.data.Subset(ds, [0])
+        vds = torch.utils.data.Subset(vds, ds_idxs[:len(vds)])
     if args['--n']:
         n_samples = int(args['--n'])
         ds = torch.utils.data.Subset(ds, range(n_samples))
@@ -116,7 +121,8 @@ def main(args):
 
     model = EfficientDet(drop_rate=0, drop_connect_rate=0).cuda()
 
-    opt = torch.optim.AdamW(model.parameters(), lr=lr)
+    opt = torch.optim.AdamW(model.parameters(), 
+        lr=lr, weight_decay=1e-4)
 
     nowstr = datetime.datetime.now().strftime("%Y-%m-%d--%H-%M-%S")
     epochs_dir = Path('.') / 'epochs' / nowstr
@@ -219,9 +225,9 @@ def main(args):
                 total_cls_loss = 0.
 
                 for i, cell_sz in enumerate(CELL_SZS):
-                    pboxes = preds[i][0]
+                    # pboxes = preds[i][0]
                     # clip w, h to prevent instability
-                    pboxes[:,3:5] = torch.clamp(pboxes[:,3:5], max=3)
+                    # pboxes[:,3:5] = torch.clamp(pboxes[:,3:5], max=3)
                     coord_loss, obj_loss, cls_loss = calc_loss(cell_sz, preds[i], 
                         boxes[i].cuda(), classes[i].cuda(), score_masks[i])
                     total_coord_loss += coord_loss

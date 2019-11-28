@@ -13,7 +13,7 @@ import random
 import itertools
 from pathlib import Path
 from collections import defaultdict, OrderedDict
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from config import COCO_PATH, INPUT_SZ, BOX_PRED_SZ, CLASS_PRED_SZ, CELL_SZS, \
     CATEGORY_INFO, CAT_ID_TO_IDX, CAT_IDX_TO_NAME
@@ -43,6 +43,7 @@ def argmax2d(x):
 class CocoDataset(torch.utils.data.Dataset):
     def __init__(self, is_train, img_size, img_transform=None, return_extra=False):
         name = 'train2017' if is_train else 'val2017'
+        self.is_train = is_train
         self.img_size = img_size
         self.img_transform = img_transform
         self.return_extra = return_extra
@@ -73,6 +74,9 @@ class CocoDataset(torch.utils.data.Dataset):
         orig_w, orig_h = img.size
         w_ratio = self.img_size / orig_w
         h_ratio = self.img_size / orig_h
+        flipped = self.is_train and bool(torch.rand(1).item() > 0.5)
+        if flipped:
+            img = ImageOps.mirror(img)
         if self.return_extra:
             orig_img = img.copy()
         img = img.resize((self.img_size, self.img_size), Image.BICUBIC)
@@ -94,6 +98,8 @@ class CocoDataset(torch.utils.data.Dataset):
             y *= h_ratio
             w *= w_ratio
             h *= h_ratio
+            if flipped:
+                x = INPUT_SZ - x - w - 1
             x0, x1 = x, x+w
             y0, y1 = y, y+h
             bbox = [x0, y0, x1, y1]

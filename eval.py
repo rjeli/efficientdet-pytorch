@@ -91,7 +91,8 @@ def main(args):
         font = ImageFont.truetype(font_path, 12)
 
         def sigmoid(x):
-            return 1 / (1+np.exp(-x))
+            # return 1 / (1+np.exp(-x))
+            return np.exp(-np.logaddexp(0, -x))
 
         for scale_i, cell_sz in enumerate(CELL_SZS):
             # gt
