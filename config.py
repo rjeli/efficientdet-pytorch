@@ -32,6 +32,7 @@ def get_category_info():
 
 CATEGORY_INFO = get_category_info()
 CAT_ID_TO_IDX = {cid: i for i, cid in enumerate(CATEGORY_INFO.keys())}
+CAT_IDX_TO_ID = {i: cid for i, cid in enumerate(CATEGORY_INFO.keys())}
 CAT_IDX_TO_NAME = {i: c['name'] for i, c in enumerate(CATEGORY_INFO.values())}
 
 N_CLASSES = len(CATEGORY_INFO)

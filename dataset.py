@@ -41,12 +41,15 @@ def argmax2d(x):
     return (a//x.shape[1], a%x.shape[1])
 
 class CocoDataset(torch.utils.data.Dataset):
-    def __init__(self, is_train, img_size, img_transform=None, return_extra=False):
+    def __init__(self, is_train, img_size, img_transform=None, flips=False,
+                 return_info=False, return_orig_img=False):
         name = 'train2017' if is_train else 'val2017'
         self.is_train = is_train
         self.img_size = img_size
         self.img_transform = img_transform
-        self.return_extra = return_extra
+        self.flips = flips
+        self.return_info = return_info
+        self.return_orig_img = return_orig_img
         self.imgs_path = COCO_PATH / name
         ann_path = COCO_PATH / 'annotations' / ('instances_'+name+'.json')
         ann_cache_path = ann_path.with_suffix('.pickle')
@@ -74,11 +77,10 @@ class CocoDataset(torch.utils.data.Dataset):
         orig_w, orig_h = img.size
         w_ratio = self.img_size / orig_w
         h_ratio = self.img_size / orig_h
-        # flipped = self.is_train and bool(torch.rand(1).item() > 0.5)
-        flipped = False
+        flipped = self.flips and bool(torch.rand(1).item() > 0.5)
         if flipped:
             img = ImageOps.mirror(img)
-        if self.return_extra:
+        if self.return_orig_img:
             orig_img = img.copy()
         img = img.resize((self.img_size, self.img_size), Image.BICUBIC)
         if self.img_transform is not None:
@@ -146,8 +148,10 @@ class CocoDataset(torch.utils.data.Dataset):
             classes[best_scale][best_row, best_col] = cat_idx
             score_masks[best_scale][best_row, best_col] = 2
         rets = [img, boxes, classes, score_masks]
-        if self.return_extra:
-            rets.append((info, orig_img))
+        if self.return_info:
+            rets.append(info)
+        if self.return_orig_img:
+            rets.append(orig_img)
         return tuple(rets)
 
 if __name__ == '__main__':

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Usage:
-    ./eval.py <model> [--coco] [--show=<n>] [--thres=<p>]
+    ./eval.py <model> [--parallel] [--coco] [--show=<n>] [--thres=<p>]
 """
 
 from docopt import docopt
@@ -26,22 +26,23 @@ from pycocotools.cocoeval import COCOeval
 # @profile
 def main(args):
     model = EfficientDet().cuda()
-    # model = torch.nn.DataParallel(model)
+    if args['--parallel']:
+        model = torch.nn.DataParallel(model)
     model.load_state_dict(torch.load(args['<model>'])['model'])
     model.eval()
 
     batch_sz = 16
 
-    ds = CocoDataset(is_train=True, img_size=INPUT_SZ, 
-        img_transform=img_transform, 
-        return_extra=True)
-
-    # split_sz = int(0.01*len(ds))
-    # ds, _ = torch.utils.data.random_split(ds, [split_sz, len(ds)-split_sz])
-
     if args['--coco']:
+        ds = CocoDataset(is_train=False, img_size=INPUT_SZ, 
+            img_transform=img_transform, 
+            return_info=True)
+
+        split_sz = int(len(ds))
+        ds, _ = torch.utils.data.random_split(ds, [split_sz, len(ds)-split_sz])
+
         dl = torch.utils.data.DataLoader(ds, 
-            batch_size=batch_sz, shuffle=False, num_workers=4)
+            batch_size=batch_sz, shuffle=False, num_workers=8)
 
         results = []
 
@@ -54,7 +55,8 @@ def main(args):
 
             add_coco_preds(preds, infos, results)
 
-        
+        print(len(results))
+
         cocoGt = COCO(str(COCO_PATH/'annotations'/'instances_val2017.json'))
         cocoDt = cocoGt.loadRes(results)
 
@@ -66,10 +68,14 @@ def main(args):
 
     print(args['--show'])
     if args['--show']:
+        ds = CocoDataset(is_train=True, img_size=INPUT_SZ, 
+            img_transform=img_transform, 
+            return_orig_img=True)
+
         idx = int(args['--show'])
         thres = float(args['--thres'])
         print('showing', idx, 'at thres', thres)
-        img, boxes, classes, score_masks, (info, orig_img) = ds[idx]
+        img, boxes, classes, score_masks, orig_img = ds[idx]
         orig_w, orig_h = orig_img.size
         def clamp_x(x):
             return max(0, min(orig_w-1, x))

@@ -12,10 +12,6 @@ import torch.onnx
 import torch.nn as nn
 import torch.nn.functional as F
 
-from efficientnet_pytorch.model import EfficientNet, MBConvBlock
-from efficientnet_pytorch.utils import BlockArgs, BlockDecoder, \
-    round_filters, round_repeats
-
 import geffnet
 from geffnet.efficientnet_builder import decode_arch_def, EfficientNetBuilder, \
     InvertedResidual, DepthwiseSeparableConv
@@ -29,14 +25,28 @@ def dbgsz(s, x):
         print(f'{s}: {x.shape}')
     return x
 
-def conv_block(in_ch, out_ch, k, act=True):
-    layers = [
-        nn.Conv2d(in_ch, out_ch, k, padding=k//2),
-    ]
-    if act:
-        layers.append(nn.BatchNorm2d(out_ch))
-        layers.append(nn.ReLU())
-    return nn.Sequential(*layers)
+if os.environ.get('OLD_CONV_BLOCK'):
+    def ConvBlock(in_ch, out_ch, k, act=True):
+        layers = [nn.Conv2d(in_ch, out_ch, k, padding=k//2)]
+        if act:
+            layers.append(nn.BatchNorm2d(out_ch))
+            layers.append(nn.ReLU())
+        return nn.Sequential(*layers)
+else:
+    class ConvBlock(nn.Module):
+        def __init__(self, in_ch, out_ch, k, act=True):
+            super().__init__()
+            self.conv = nn.Conv2d(in_ch, out_ch, k, padding=k//2)
+            self.act = act
+            if self.act:
+                self.bn = nn.BatchNorm2d(out_ch)
+        def forward(self, x):
+            x = self.conv(x)
+            if self.act:
+                x = self.bn(x)
+                return F.relu(x)
+            else:
+                return x
 
 class BiFPN(nn.Module):
     def __init__(self, n_inputs, n_chs):
@@ -50,11 +60,11 @@ class BiFPN(nn.Module):
 
         self.intermediate_convs = nn.ModuleList([])
         for _ in range(self.n_inputs-2):
-            self.intermediate_convs.append(conv_block(
+            self.intermediate_convs.append(ConvBlock(
                 in_ch=n_chs, out_ch=n_chs, k=3))
         self.output_convs = nn.ModuleList([])
         for _ in range(self.n_inputs):
-            self.output_convs.append(conv_block(
+            self.output_convs.append(ConvBlock(
                 in_ch=n_chs, out_ch=n_chs, k=3))
 
     @staticmethod
@@ -102,7 +112,7 @@ class ExtendedEN(nn.Module):
 
         en = geffnet.efficientnet_b0(
             pretrained=True, as_sequential=True,
-            drop_rate=0, drop_connect_rate=0)
+            drop_rate=0, drop_connect_rate=.2)
         self.en_blocks = nn.ModuleList(iter(en[:9]))
 
         arch = [
@@ -145,7 +155,7 @@ class EfficientDet(nn.Module):
         self.bifpn_input_convs = nn.ModuleList([])
         for b in self.en.output_blocks:
             in_ch = b[-1].bn3.num_features
-            self.bifpn_input_convs.append(conv_block(
+            self.bifpn_input_convs.append(ConvBlock(
                 in_ch=in_ch, out_ch=self.bifpn_n_chs, k=3))
 
         self.bifpns = nn.ModuleList([])
@@ -158,13 +168,13 @@ class EfficientDet(nn.Module):
         class_layers = []
         for _ in range(self.heads_n_layers):
             box_layers.append(
-                conv_block(in_ch=self.bifpn_n_chs, out_ch=self.bifpn_n_chs, k=3))
+                ConvBlock(in_ch=self.bifpn_n_chs, out_ch=self.bifpn_n_chs, k=3))
             class_layers.append(
-                conv_block(in_ch=self.bifpn_n_chs, out_ch=self.bifpn_n_chs, k=3))
+                ConvBlock(in_ch=self.bifpn_n_chs, out_ch=self.bifpn_n_chs, k=3))
         # output layers
-        box_layers.append(conv_block(
+        box_layers.append(ConvBlock(
             in_ch=self.bifpn_n_chs, out_ch=BOX_PRED_SZ, k=3, act=False))
-        class_layers.append(conv_block(
+        class_layers.append(ConvBlock(
             in_ch=self.bifpn_n_chs, out_ch=CLASS_PRED_SZ, k=3, act=False))
         self.box_layers = nn.Sequential(*box_layers)
         self.class_layers = nn.Sequential(*class_layers)
@@ -196,13 +206,13 @@ class NoBifpnNet(nn.Module):
         for b in self.en.output_blocks:
             in_ch = b[-1].bn3.num_features
             self.boxnets.append(nn.Sequential(
-                conv_block(in_ch=in_ch, out_ch=n_ch, k=3),
-                conv_block(in_ch=n_ch, out_ch=n_ch, k=3),
-                conv_block(in_ch=n_ch, out_ch=BOX_PRED_SZ, k=3, act=False)))
+                ConvBlock(in_ch=in_ch, out_ch=n_ch, k=3),
+                ConvBlock(in_ch=n_ch, out_ch=n_ch, k=3),
+                ConvBlock(in_ch=n_ch, out_ch=BOX_PRED_SZ, k=3, act=False)))
             self.clsnets.append(nn.Sequential(
-                conv_block(in_ch=in_ch, out_ch=n_ch, k=3),
-                conv_block(in_ch=n_ch, out_ch=n_ch, k=3),
-                conv_block(in_ch=n_ch, out_ch=CLASS_PRED_SZ, k=3, act=False)))
+                ConvBlock(in_ch=in_ch, out_ch=n_ch, k=3),
+                ConvBlock(in_ch=n_ch, out_ch=n_ch, k=3),
+                ConvBlock(in_ch=n_ch, out_ch=CLASS_PRED_SZ, k=3, act=False)))
     def forward(self, x):
         outputs = []
         for en_out, boxnet, clsnet in zip(self.en(x), self.boxnets, self.clsnets):
@@ -214,28 +224,28 @@ class StupidNet(nn.Module):
         super().__init__()
         chs = 64
         self.downsamples = nn.ModuleList([nn.Sequential(
-                conv_block(3, chs, k=3),
+                ConvBlock(3, chs, k=3),
                 nn.MaxPool2d(2),
-                conv_block(chs, chs, k=3),
+                ConvBlock(chs, chs, k=3),
                 nn.MaxPool2d(2),
-                conv_block(chs, chs, k=3),
+                ConvBlock(chs, chs, k=3),
                 nn.MaxPool2d(2),
         )])
         for _ in range(4):
             self.downsamples.append(nn.Sequential(
-                conv_block(chs, chs, k=3),
+                ConvBlock(chs, chs, k=3),
                 nn.MaxPool2d(2),
             ))
         self.boxnets, self.clsnets = nn.ModuleList([]), nn.ModuleList([])
         for i in range(5):
             self.boxnets.append(nn.Sequential(
-                conv_block(chs, chs, k=3),
-                conv_block(chs, chs, k=3),
-                conv_block(chs, BOX_PRED_SZ, k=3, act=False)))
+                ConvBlock(chs, chs, k=3),
+                ConvBlock(chs, chs, k=3),
+                ConvBlock(chs, BOX_PRED_SZ, k=3, act=False)))
             self.clsnets.append(nn.Sequential(
-                conv_block(chs, chs, k=3),
-                conv_block(chs, chs, k=3),
-                conv_block(chs, CLASS_PRED_SZ, k=3, act=False)))
+                ConvBlock(chs, chs, k=3),
+                ConvBlock(chs, chs, k=3),
+                ConvBlock(chs, CLASS_PRED_SZ, k=3, act=False)))
 
     def forward(self, x):
         outputs = []
