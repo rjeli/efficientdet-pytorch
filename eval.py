@@ -10,10 +10,10 @@ from tqdm import tqdm
 import torch
 import numpy as np
 
-from model import EfficientDet
+from model import EfficientDet, NoBifpnNet, StupidNet
 from dataset import CocoDataset
 from train import img_transform
-from config import INPUT_SZ, CELL_SZS, CAT_IDX_TO_NAME, CELL_CENTERS
+from config import INPUT_SZ, CELL_SZS, CAT_IDX_TO_NAME, CELL_CENTERS, COCO_PATH
 from cython_utils import add_coco_preds
 
 from pathlib import Path
@@ -26,6 +26,7 @@ from pycocotools.cocoeval import COCOeval
 # @profile
 def main(args):
     model = EfficientDet().cuda()
+    # model = torch.nn.DataParallel(model)
     model.load_state_dict(torch.load(args['<model>'])['model'])
     model.eval()
 
@@ -53,7 +54,8 @@ def main(args):
 
             add_coco_preds(preds, infos, results)
 
-        cocoGt = COCO(str(Path.home()/'coco'/'annotations'/'instances_val2017.json'))
+        
+        cocoGt = COCO(str(COCO_PATH/'annotations'/'instances_val2017.json'))
         cocoDt = cocoGt.loadRes(results)
 
         cocoEval = COCOeval(cocoGt, cocoDt, 'bbox')
@@ -69,6 +71,10 @@ def main(args):
         print('showing', idx, 'at thres', thres)
         img, boxes, classes, score_masks, (info, orig_img) = ds[idx]
         orig_w, orig_h = orig_img.size
+        def clamp_x(x):
+            return max(0, min(orig_w-1, x))
+        def clamp_y(y):
+            return max(0, min(orig_h-1, y))
         w_ratio = orig_w / INPUT_SZ
         h_ratio = orig_h / INPUT_SZ
 
@@ -101,6 +107,20 @@ def main(args):
 
             pbox, pcls = preds[scale_i]
 
+            torch.set_printoptions(precision=2)
+
+            xx = torch.from_numpy(pbox)[None][:,0]
+            print('xx:', xx)
+            yy = sbox[None][:,0]
+            print('yy:', yy)
+
+            import torch.nn.functional as F
+            obj_bce = F.binary_cross_entropy_with_logits(xx, yy, reduction='none')
+            print('bce:', obj_bce)
+            print('min:', obj_bce.min())
+            print('max:', obj_bce.max())
+            print('mean:', obj_bce.mean())
+
             for row in range(INPUT_SZ//cell_sz):
                 for col in range(INPUT_SZ//cell_sz):
 
@@ -116,12 +136,14 @@ def main(args):
                         cy = (row*cell_sz + cy*cell_sz) * h_ratio
                         w = w * cell_sz * w_ratio
                         h = h * cell_sz * h_ratio
-                        x0 = int(cx-w/2)
-                        y0 = int(cy-h/2) 
-                        x1 = int(cx+w/2)
-                        y1 = int(cy+h/2)
-                        draw.rectangle([x0,y0,x1,y1], fill=None, outline=(0,255,0))
-                        draw.text((x0,y0-12), cls_name, fill=(0,255,0), font=font)
+                        x0 = clamp_x(int(cx-w/2))
+                        y0 = clamp_y(int(cy-h/2))
+                        x1 = clamp_x(int(cx+w/2))
+                        y1 = clamp_y(int(cy+h/2))
+                        draw.rectangle([x0,y0,x1,y1], 
+                            fill=None, outline=(0,255,0))
+                        draw.text((clamp_x(x0),clamp_y(y0-12)), 
+                            cls_name, fill=(0,255,0), font=font)
 
                     # draw pred
                     score = sigmoid(pbox[0,row,col])
@@ -147,14 +169,15 @@ def main(args):
                         h = h * cell_sz * h_ratio
                         print(f'  1 cx:{cx:.2f} cy:{cy:.2f} w:{w:.2f} h:{h:.2f}')
 
-                        x0 = int(cx-w/2)
-                        y0 = int(cy-h/2) 
-                        x1 = int(cx+w/2)
-                        y1 = int(cy+h/2)
+                        x0 = clamp_x(int(cx-w/2))
+                        y0 = clamp_y(int(cy-h/2))
+                        x1 = clamp_x(int(cx+w/2))
+                        y1 = clamp_y(int(cy+h/2))
                         draw.rectangle([x0,y0,x1,y1], 
-                            fill=None, outline=(255,255,0))
-                        draw.text((min(orig_w,max(0,x0)),min(orig_h,max(0,y0-12))), 
-                            cls_name, fill=(255,255,0), font=font)
+                            fill=None, outline=(255,0,0))
+                        draw.text(
+                            (min(orig_w,max(0,x0)),min(orig_h,max(0,y0-12))), 
+                            cls_name, fill=(255,0,0), font=font)
 
         orig_img.save('evalshow.png')
 

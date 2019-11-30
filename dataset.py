@@ -74,7 +74,8 @@ class CocoDataset(torch.utils.data.Dataset):
         orig_w, orig_h = img.size
         w_ratio = self.img_size / orig_w
         h_ratio = self.img_size / orig_h
-        flipped = self.is_train and bool(torch.rand(1).item() > 0.5)
+        # flipped = self.is_train and bool(torch.rand(1).item() > 0.5)
+        flipped = False
         if flipped:
             img = ImageOps.mirror(img)
         if self.return_extra:

@@ -21,7 +21,7 @@ from geffnet.efficientnet_builder import decode_arch_def, EfficientNetBuilder, \
     InvertedResidual, DepthwiseSeparableConv
 from geffnet.activations import get_act_layer
 
-from config import N_CLASSES, INPUT_SZ, BOX_PRED_SZ, CLASS_PRED_SZ
+from config import N_CLASSES, INPUT_SZ, BOX_PRED_SZ, CLASS_PRED_SZ, CELL_SZS
 
 DEBUG_SIZES = os.environ.get('DBG_SZS') is not None
 def dbgsz(s, x):
@@ -29,26 +29,17 @@ def dbgsz(s, x):
         print(f'{s}: {x.shape}')
     return x
 
-EXTRA_BLOCKS_ARGS = [
-    'r4_k5_s22_e6_i192_o224_se0.25',
-    'r4_k5_s22_e6_i224_o256_se0.25',
-]
-BIFPN_INPUT_LAYER_IDXS = [5, 7, 8, 9, 10]
-BIFPN_N_LAYERS = 2
-BIFPN_N_CHS = 64
-BOX_CLASS_N_LAYERS = 3
-
 def conv_block(in_ch, out_ch, k, act=True):
     layers = [
         nn.Conv2d(in_ch, out_ch, k, padding=k//2),
-        nn.BatchNorm2d(out_ch),
     ]
     if act:
+        layers.append(nn.BatchNorm2d(out_ch))
         layers.append(nn.ReLU())
     return nn.Sequential(*layers)
 
 class BiFPN(nn.Module):
-    def __init__(self, n_inputs):
+    def __init__(self, n_inputs, n_chs):
         super().__init__()
         self.n_inputs = n_inputs
 
@@ -60,11 +51,11 @@ class BiFPN(nn.Module):
         self.intermediate_convs = nn.ModuleList([])
         for _ in range(self.n_inputs-2):
             self.intermediate_convs.append(conv_block(
-                in_ch=BIFPN_N_CHS, out_ch=BIFPN_N_CHS, k=3))
+                in_ch=n_chs, out_ch=n_chs, k=3))
         self.output_convs = nn.ModuleList([])
         for _ in range(self.n_inputs):
             self.output_convs.append(conv_block(
-                in_ch=BIFPN_N_CHS, out_ch=BIFPN_N_CHS, k=3))
+                in_ch=n_chs, out_ch=n_chs, k=3))
 
     @staticmethod
     def fast_fuse(xs, ws):
@@ -105,12 +96,13 @@ class BiFPN(nn.Module):
             outputs.append(self.output_convs[i](fused))
         return outputs
 
-class EfficientDet(nn.Module):
-    def __init__(self, drop_rate=.25, drop_connect_rate=.2):
+class ExtendedEN(nn.Module):
+    def __init__(self):
         super().__init__()
 
-        en = geffnet.efficientnet_b0(pretrained=True, as_sequential=True,
-            drop_rate=drop_rate, drop_connect_rate=drop_connect_rate)
+        en = geffnet.efficientnet_b0(
+            pretrained=True, as_sequential=True,
+            drop_rate=0, drop_connect_rate=0)
         self.en_blocks = nn.ModuleList(iter(en[:9]))
 
         arch = [
@@ -121,47 +113,67 @@ class EfficientDet(nn.Module):
 
         en_builder = EfficientNetBuilder(
             act_layer=get_act_layer('swish'),
-            drop_connect_rate=drop_connect_rate)
+            drop_connect_rate=0)
         en_builder.in_chs = 192
         en_builder.block_count = sum(len(x) for x in block_args)
         en_builder.block_idx = 9
         for ba in block_args:
             self.en_blocks.append(en_builder._make_stack(ba))
 
+        self.output_idxs = [5, 7, 8, 9, 10]
+        self.output_blocks = [self.en_blocks[i] for i in self.output_idxs]
+
+    def forward(self, x):
+        outputs = []
+        for i, b in enumerate(self.en_blocks):
+            x = b(x)
+            if i in self.output_idxs:
+                outputs.append(x)
+        return outputs
+
+class EfficientDet(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        # params (set nicely later)
+        self.bifpn_n_layers = 2
+        self.bifpn_n_chs = 64
+        self.heads_n_layers = 3
+
+        self.en = ExtendedEN()
+
         self.bifpn_input_convs = nn.ModuleList([])
-        for i in BIFPN_INPUT_LAYER_IDXS:
-            in_ch = self.en_blocks[i][-1].bn3.num_features
+        for b in self.en.output_blocks:
+            in_ch = b[-1].bn3.num_features
             self.bifpn_input_convs.append(conv_block(
-                in_ch=in_ch, out_ch=BIFPN_N_CHS, k=3))
+                in_ch=in_ch, out_ch=self.bifpn_n_chs, k=3))
 
         self.bifpns = nn.ModuleList([])
-        for _ in range(BIFPN_N_LAYERS):
-            self.bifpns.append(BiFPN(n_inputs=len(BIFPN_INPUT_LAYER_IDXS)))
+        for _ in range(self.bifpn_n_layers):
+            self.bifpns.append(BiFPN(
+                n_inputs=len(self.en.output_blocks),
+                n_chs=self.bifpn_n_chs))
 
         box_layers = []
         class_layers = []
-        for _ in range(BOX_CLASS_N_LAYERS):
+        for _ in range(self.heads_n_layers):
             box_layers.append(
-                conv_block(in_ch=BIFPN_N_CHS, out_ch=BIFPN_N_CHS, k=3))
+                conv_block(in_ch=self.bifpn_n_chs, out_ch=self.bifpn_n_chs, k=3))
             class_layers.append(
-                conv_block(in_ch=BIFPN_N_CHS, out_ch=BIFPN_N_CHS, k=3))
+                conv_block(in_ch=self.bifpn_n_chs, out_ch=self.bifpn_n_chs, k=3))
         # output layers
-        box_layers.append(conv_block(BIFPN_N_CHS, BOX_PRED_SZ, k=3, act=False))
-        class_layers.append(conv_block(BIFPN_N_CHS, CLASS_PRED_SZ, k=3, act=False))
+        box_layers.append(conv_block(
+            in_ch=self.bifpn_n_chs, out_ch=BOX_PRED_SZ, k=3, act=False))
+        class_layers.append(conv_block(
+            in_ch=self.bifpn_n_chs, out_ch=CLASS_PRED_SZ, k=3, act=False))
         self.box_layers = nn.Sequential(*box_layers)
         self.class_layers = nn.Sequential(*class_layers)
 
     def forward(self, x):
         dbgsz('input', x)
         bifpn_xs = []
-        for i, b in enumerate(self.en_blocks):
-            x = b(x)
-            dbgsz(f'block {i}', x)
-            if i in BIFPN_INPUT_LAYER_IDXS:
-                bifpn_xs.append(x)
-        bifpn_xs = [bic(x) for bic, x in zip(self.bifpn_input_convs, bifpn_xs)]
-        for i, bifpn_x in enumerate(bifpn_xs):
-            dbgsz(f'bifpn_input {i}', bifpn_x)
+        for en_output, bic in zip(self.en(x), self.bifpn_input_convs):
+            bifpn_xs.append(bic(en_output))
         for i, bifpn in enumerate(self.bifpns):
             bifpn_xs = bifpn(*bifpn_xs)
             for j, bifpn_x in enumerate(bifpn_xs):
@@ -173,6 +185,63 @@ class EfficientDet(nn.Module):
             # clamp w, h to prevent exp overflow
             if not self.train:
                 box_pred[:,3:5] = torch.clamp(box_pred[:,3:5], max=3)
+        return outputs
+
+class NoBifpnNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.en = ExtendedEN()
+        self.boxnets, self.clsnets = nn.ModuleList([]), nn.ModuleList([])
+        n_ch = 256
+        for b in self.en.output_blocks:
+            in_ch = b[-1].bn3.num_features
+            self.boxnets.append(nn.Sequential(
+                conv_block(in_ch=in_ch, out_ch=n_ch, k=3),
+                conv_block(in_ch=n_ch, out_ch=n_ch, k=3),
+                conv_block(in_ch=n_ch, out_ch=BOX_PRED_SZ, k=3, act=False)))
+            self.clsnets.append(nn.Sequential(
+                conv_block(in_ch=in_ch, out_ch=n_ch, k=3),
+                conv_block(in_ch=n_ch, out_ch=n_ch, k=3),
+                conv_block(in_ch=n_ch, out_ch=CLASS_PRED_SZ, k=3, act=False)))
+    def forward(self, x):
+        outputs = []
+        for en_out, boxnet, clsnet in zip(self.en(x), self.boxnets, self.clsnets):
+            outputs.append((boxnet(en_out), clsnet(en_out)))
+        return outputs
+
+class StupidNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        chs = 64
+        self.downsamples = nn.ModuleList([nn.Sequential(
+                conv_block(3, chs, k=3),
+                nn.MaxPool2d(2),
+                conv_block(chs, chs, k=3),
+                nn.MaxPool2d(2),
+                conv_block(chs, chs, k=3),
+                nn.MaxPool2d(2),
+        )])
+        for _ in range(4):
+            self.downsamples.append(nn.Sequential(
+                conv_block(chs, chs, k=3),
+                nn.MaxPool2d(2),
+            ))
+        self.boxnets, self.clsnets = nn.ModuleList([]), nn.ModuleList([])
+        for i in range(5):
+            self.boxnets.append(nn.Sequential(
+                conv_block(chs, chs, k=3),
+                conv_block(chs, chs, k=3),
+                conv_block(chs, BOX_PRED_SZ, k=3, act=False)))
+            self.clsnets.append(nn.Sequential(
+                conv_block(chs, chs, k=3),
+                conv_block(chs, chs, k=3),
+                conv_block(chs, CLASS_PRED_SZ, k=3, act=False)))
+
+    def forward(self, x):
+        outputs = []
+        for ds, bn, cn in zip(self.downsamples, self.boxnets, self.clsnets):
+            x = ds(x)
+            outputs.append((bn(x), cn(x)))
         return outputs
 
 if __name__ == '__main__':
