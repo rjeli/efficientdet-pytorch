@@ -17,6 +17,9 @@ Options:
     --flips         Augment with flips
     --parallel
     --data-dir=<d>  Data directory [default: /data]
+    --reset-cycle
+    --from0
+    --jitter
 """
 
 from tqdm import tqdm
@@ -88,7 +91,7 @@ def calc_loss(preds, gt_boxes, gt_classes, score_masks,
     losses = (coord_loss, obj_loss, cls_loss)
     return tuple(l.mean() for l in losses) if apply_mean else losses
 
-def param_groups(model, weight_decay):
+def param_groups(model, lr, weight_decay):
     decay, no_decay = [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
@@ -99,8 +102,8 @@ def param_groups(model, weight_decay):
         else:
             decay.append(p)
     return [
-        {'params': decay, 'weight_decay': weight_decay},
-        {'params': no_decay, 'weight_decay': 0.},
+        {'params': decay, 'weight_decay': weight_decay, 'lr': lr},
+        {'params': no_decay, 'weight_decay': 0., 'lr': lr},
     ]
 
 def short_sci(x):
@@ -116,7 +119,8 @@ def main(args):
     assert torch.cuda.is_available()
 
     ds = CocoDataset(is_train=True, img_size=INPUT_SZ, 
-        img_transform=img_transform, flips=args['--flips'])
+        img_transform=aug_transform if args['--jitter'] else img_transform, 
+        flips=args['--flips'])
     vds = CocoDataset(is_train=False, img_size=INPUT_SZ, 
         img_transform=img_transform, return_info=True)
 
@@ -169,7 +173,8 @@ def main(args):
         model = nn.DataParallel(model)
 
     # opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=.9)
-    opt = torch.optim.AdamW(param_groups(model, weight_decay=1e-4))
+    opt = torch.optim.AdamW(param_groups(model, 
+        lr=max_lr, weight_decay=1e-4))
 
     if args['--find-lr']:
         assert len(ds)//bs >= 100
@@ -231,14 +236,24 @@ def main(args):
     if args['--resume']:
         ckpt = torch.load(args['--resume'])
         model.load_state_dict(ckpt['model'])
-        opt.load_state_dict(ckpt['opt'])
-        start_epoch = ckpt['epoch'] + 1
+        if not args['--from0']:
+            opt.load_state_dict(ckpt['opt'])
+            for param_group in opt.param_groups:
+                param_group['lr'] = max_lr
+            start_epoch = ckpt['epoch'] + 1
         print('resuming from', start_epoch)
 
+    if args['--reset-cycle']:
+        last_epoch = -1
+    else:
+        last_epoch = start_epoch*len(dl)-1
     lr_sched = torch.optim.lr_scheduler.OneCycleLR(opt,
         max_lr=max_lr, div_factor=10, # start at lr/10
-        steps_per_epoch=len(dl), epochs=epochs,
-        last_epoch=start_epoch*len(dl)-1)
+        steps_per_epoch=len(dl), epochs=(epochs-start_epoch),
+        last_epoch=last_epoch)
+    """
+    lr_sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, verbose=True)
+    """
 
     name = ''
     now = datetime.datetime.now(pytz.timezone('US/Pacific'))
@@ -256,6 +271,8 @@ def main(args):
     name += f'_maxlr{short_sci(max_lr)}'
     if args['--flips']:
         name += '_flips'
+    if args['--jitter']:
+        name += '_jitter'
     if start_epoch != 0:
         name += f'_resume{start_epoch}'
     name += '_' + str(uuid.uuid4())[:4]
@@ -313,7 +330,6 @@ def main(args):
             opt.zero_grad()
             total_loss.backward()
             opt.step()
-            lr_sched.step()
 
             epoch_loss_t += total_loss.item() / len(dl)
             epoch_coord_loss_t += coord_losses.item() / len(dl)
@@ -328,12 +344,16 @@ def main(args):
             prof.__exit__(None, None, None)
             prof.export_chrome_trace(f'prof{epoch}.chrometrace')
 
-        writer.add_scalar('train_loss/total', epoch_loss_t, epoch)
-        writer.add_scalar('train_loss/coord', epoch_coord_loss_t, epoch)
-        writer.add_scalar('train_loss/obj', epoch_obj_loss_t, epoch)
-        writer.add_scalar('train_loss/cls', epoch_cls_loss_t, epoch)
-        writer.add_scalar('lr', lr_sched.get_lr()[0], epoch)
+        nsteps = (epoch+1)*len(dl)
+
+        writer.add_scalar('train_loss/total', epoch_loss_t, nsteps)
+        writer.add_scalar('train_loss/coord', epoch_coord_loss_t, nsteps)
+        writer.add_scalar('train_loss/obj', epoch_obj_loss_t, nsteps)
+        writer.add_scalar('train_loss/cls', epoch_cls_loss_t, nsteps)
+        writer.add_scalar('lr', opt.param_groups[0]['lr'], nsteps)
         writer.flush()
+
+        lr_sched.step(epoch_loss_t)
 
         model.eval()
 
@@ -377,10 +397,10 @@ def main(args):
                          for objs, cls in preds]
                 add_coco_preds(preds, infos, coco_results)
 
-        writer.add_scalar('val_loss/total', epoch_loss_v, epoch)
-        writer.add_scalar('val_loss/coord', epoch_coord_loss_v, epoch)
-        writer.add_scalar('val_loss/obj', epoch_obj_loss_v, epoch)
-        writer.add_scalar('val_loss/cls', epoch_cls_loss_v, epoch)
+        writer.add_scalar('val_loss/total', epoch_loss_v, nsteps)
+        writer.add_scalar('val_loss/coord', epoch_coord_loss_v, nsteps)
+        writer.add_scalar('val_loss/obj', epoch_obj_loss_v, nsteps)
+        writer.add_scalar('val_loss/cls', epoch_cls_loss_v, nsteps)
 
         if len(coco_results) > 0:
             cocoDt = cocoGt.loadRes(coco_results)
@@ -389,17 +409,17 @@ def main(args):
             cocoEval.evaluate()
             cocoEval.accumulate()
             cocoEval.summarize()
-            writer.add_scalar('coco/map', cocoEval.stats[0], epoch)
-            writer.add_scalar('coco/map_50', cocoEval.stats[1], epoch)
-            writer.add_scalar('coco/map_small', cocoEval.stats[3], epoch)
-            writer.add_scalar('coco/map_medium', cocoEval.stats[4], epoch)
-            writer.add_scalar('coco/map_large', cocoEval.stats[5], epoch)
+            writer.add_scalar('coco/map', cocoEval.stats[0], nsteps)
+            writer.add_scalar('coco/map_50', cocoEval.stats[1], nsteps)
+            writer.add_scalar('coco/map_small', cocoEval.stats[3], nsteps)
+            writer.add_scalar('coco/map_medium', cocoEval.stats[4], nsteps)
+            writer.add_scalar('coco/map_large', cocoEval.stats[5], nsteps)
         else:
-            writer.add_scalar('coco/map', 0, epoch)
-            writer.add_scalar('coco/map_50', 0, epoch)
-            writer.add_scalar('coco/map_small', 0, epoch)
-            writer.add_scalar('coco/map_medium', 0, epoch)
-            writer.add_scalar('coco/map_large', 0, epoch)
+            writer.add_scalar('coco/map', 0, nsteps)
+            writer.add_scalar('coco/map_50', 0, nsteps)
+            writer.add_scalar('coco/map_small', 0, nsteps)
+            writer.add_scalar('coco/map_medium', 0, nsteps)
+            writer.add_scalar('coco/map_large', 0, nsteps)
         writer.flush()
 
         if epoch % save == 0 or epoch == epochs-1:
